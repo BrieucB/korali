@@ -217,6 +217,12 @@ bool Bayesian::runOperation(std::string operation, korali::Sample& sample)
   return true;
  }
 
+ if (operation == "Evaluate Batch")
+ {
+  evaluateBatch(sample);
+  return true;
+ }
+
  if (operation == "Evaluate Gradient")
  {
   evaluateGradient(sample);

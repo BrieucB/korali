@@ -182,6 +182,12 @@ bool Hierarchical::runOperation(std::string operation, korali::Sample& sample)
   return true;
  }
 
+ if (operation == "Evaluate Batch")
+ {
+  evaluateBatch(sample);
+  return true;
+ }
+
  operationDetected = operationDetected || Problem::runOperation(operation, sample);
  if (operationDetected == false) KORALI_LOG_ERROR(" + Operation %s not recognized for problem Hierarchical.\n", operation.c_str());
  return operationDetected;

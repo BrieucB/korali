@@ -89,6 +89,18 @@ class Hierarchical : public Problem
    * @param sample A Korali Sample
    */
   void evaluateLogPosterior(korali::Sample &sample);
+
+  /**
+   * @brief Evaluates a batch of samples and stores batch outputs on the batch sample.
+   * @param sample A Korali batch sample
+   */
+  virtual void evaluateBatch(korali::Sample &sample) { KORALI_LOG_ERROR("Batch evaluation not yet implemented for selected Hierarchical problem."); }
+
+  /**
+   * @brief Indicates whether the problem exposes a valid batch-evaluation path.
+   * @return True when batch evaluation is enabled.
+   */
+  virtual bool supportsEvaluateBatch() const { return false; }
 };
 
 } //problem
