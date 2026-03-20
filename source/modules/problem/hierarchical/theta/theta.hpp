@@ -99,6 +99,20 @@ class Theta : public Hierarchical
    */
   std::vector<double> _precomputedLogDenominator;
 
+  /**
+   * @brief Computes the hierarchical log-likelihood correction for a single parameter vector.
+   * @param parameters Parameter vector to evaluate
+   * @return The additive hierarchical correction term
+   */
+  double calculateHierarchicalCorrection(const std::vector<double> &parameters);
+
+  /**
+   * @brief Computes the hierarchical log-likelihood correction for a batch of parameter vectors.
+   * @param batchParameters Batch of parameter vectors to evaluate
+   * @return The additive hierarchical correction term for each batch row
+   */
+  std::vector<double> calculateHierarchicalCorrectionBatch(const std::vector<std::vector<double>> &batchParameters);
+
   public: 
   /**
   * @brief Results from one previously executed Bayesian experiment.
@@ -132,6 +146,8 @@ class Theta : public Hierarchical
   
 
   void evaluateLogLikelihood(korali::Sample &sample) override;
+  void evaluateBatch(korali::Sample &sample) override;
+  bool supportsEvaluateBatch() const override;
   void initialize() override;
 };
 

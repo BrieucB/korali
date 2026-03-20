@@ -10,6 +10,78 @@ namespace hierarchical
 {
 ;
 
+double Theta::calculateHierarchicalCorrection(const std::vector<double> &parameters)
+{
+  std::vector<double> logValues;
+  logValues.resize(_psiProblemSampleCount);
+
+  for (size_t i = 0; i < _psiProblemSampleCount; i++)
+  {
+    Sample psiSample;
+    psiSample["Parameters"] = _psiProblemSampleCoordinates[i];
+
+    _psiProblem->updateConditionalPriors(psiSample);
+
+    double logConditionalPrior = 0.0;
+    for (size_t k = 0; k < _subProblemVariableCount; k++)
+      logConditionalPrior += _psiExperimentObject._distributions[_psiProblem->_conditionalPriorIndexes[k]]->getLogDensity(parameters[k]);
+
+    logValues[i] = logConditionalPrior - _precomputedLogDenominator[i];
+  }
+
+  return -log(_psiProblemSampleCount) + logSumExp(logValues);
+}
+
+std::vector<double> Theta::calculateHierarchicalCorrectionBatch(const std::vector<std::vector<double>> &batchParameters)
+{
+  const size_t batchSize = batchParameters.size();
+  if (batchSize == 0) return {};
+
+  std::vector<double> maxLogValues(batchSize, -Inf);
+  std::vector<double> sumExpValues(batchSize, 0.0);
+
+  for (size_t i = 0; i < _psiProblemSampleCount; i++)
+  {
+    Sample psiSample;
+    psiSample["Parameters"] = _psiProblemSampleCoordinates[i];
+
+    _psiProblem->updateConditionalPriors(psiSample);
+    const double denominator = _precomputedLogDenominator[i];
+
+    #pragma omp parallel for if(batchSize > 128)
+    for (size_t batchId = 0; batchId < batchSize; ++batchId)
+    {
+      double logValue = -denominator;
+      for (size_t k = 0; k < _subProblemVariableCount; k++)
+        logValue += _psiExperimentObject._distributions[_psiProblem->_conditionalPriorIndexes[k]]->getLogDensity(batchParameters[batchId][k]);
+
+      if (isfinite(maxLogValues[batchId]) == false)
+      {
+        maxLogValues[batchId] = logValue;
+        sumExpValues[batchId] = 1.0;
+      }
+      else if (logValue > maxLogValues[batchId])
+      {
+        sumExpValues[batchId] = sumExpValues[batchId] * exp(maxLogValues[batchId] - logValue) + 1.0;
+        maxLogValues[batchId] = logValue;
+      }
+      else
+      {
+        sumExpValues[batchId] += exp(logValue - maxLogValues[batchId]);
+      }
+    }
+  }
+
+  const double logPsiProblemSampleCount = log(_psiProblemSampleCount);
+  std::vector<double> corrections(batchSize, -Inf);
+
+  #pragma omp parallel for if(batchSize > 128)
+  for (size_t batchId = 0; batchId < batchSize; ++batchId)
+    corrections[batchId] = -logPsiProblemSampleCount + maxLogValues[batchId] + log(sumExpValues[batchId]);
+
+  return corrections;
+}
+
 void Theta::initialize()
 {
   // Psi Experiment
@@ -105,28 +177,73 @@ void Theta::evaluateLogLikelihood(Sample &sample)
   dynamic_cast<problem::Bayesian *>(_subExperimentObject._problem)->evaluateLoglikelihood(sample);
 
   double logLikelihood = sample["logLikelihood"].get<double>();
+  auto parameters = KORALI_GET(std::vector<double>, sample, "Parameters");
+  sample["logLikelihood"] = logLikelihood + calculateHierarchicalCorrection(parameters);
+}
 
-  std::vector<double> psiSample;
-  psiSample.resize(_psiVariableCount);
+bool Theta::supportsEvaluateBatch() const
+{
+  auto *subProblem = dynamic_cast<problem::Bayesian *>(_subExperimentObject._problem);
+  return subProblem != NULL && subProblem->supportsEvaluateBatch();
+}
 
-  std::vector<double> logValues;
-  logValues.resize(_psiProblemSampleCount);
+void Theta::evaluateBatch(Sample &sample)
+{
+  const auto batchParameters = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Parameters");
+  const size_t batchSize = batchParameters.size();
+  std::vector<double> batchLogPriors(batchSize, -Inf);
 
-  for (size_t i = 0; i < _psiProblemSampleCount; i++)
+  for (size_t i = 0; i < batchSize; ++i)
   {
-    Sample psiSample;
-    psiSample["Parameters"] = _psiProblemSampleCoordinates[i];
+    if (batchParameters[i].size() != _k->_variables.size())
+      KORALI_LOG_ERROR("Batch sample %zu provides %zu parameters, but the hierarchical problem expects %zu.\n", i, batchParameters[i].size(), _k->_variables.size());
 
-    _psiProblem->updateConditionalPriors(psiSample);
+    double logPrior = 0.0;
+    for (size_t j = 0; j < batchParameters[i].size(); ++j)
+      logPrior += _k->_distributions[_k->_variables[j]->_distributionIndex]->getLogDensity(batchParameters[i][j]);
 
-    double logConditionalPrior = 0.;
-    for (size_t k = 0; k < _subProblemVariableCount; k++)
-      logConditionalPrior += _psiExperimentObject._distributions[_psiProblem->_conditionalPriorIndexes[k]]->getLogDensity(sample["Parameters"][k]);
+    batchLogPriors[i] = logPrior;
+  }
+  sample["Batch logPrior"] = batchLogPriors;
 
-    logValues[i] = logConditionalPrior - _precomputedLogDenominator[i];
+  if (batchSize == 0)
+  {
+    sample["Batch logLikelihood"] = std::vector<double>();
+    return;
   }
 
-  sample["logLikelihood"] = logLikelihood - log(_psiProblemSampleCount) + logSumExp(logValues);
+  auto *subProblem = dynamic_cast<problem::Bayesian *>(_subExperimentObject._problem);
+  if (subProblem == NULL || subProblem->supportsEvaluateBatch() == false)
+    KORALI_LOG_ERROR("Hierarchical/Theta batch evaluation requires the sub problem to expose batch evaluation support.\n");
+
+  Sample subBatch;
+  subBatch["Module"] = "Problem";
+  subBatch["Operation"] = "Evaluate Batch";
+  subBatch["Batch Parameters"] = batchParameters;
+  subBatch["Sample Id"] = sample["Sample Id"];
+  try
+  {
+    subBatch["Batch Sample Ids"] = sample["Batch Sample Ids"];
+  }
+  catch (...)
+  {
+  }
+
+  subProblem->evaluateBatch(subBatch);
+
+  const auto subBatchLogLikelihood = KORALI_GET(std::vector<double>, subBatch, "Batch logLikelihood");
+  if (subBatchLogLikelihood.size() != batchSize)
+    KORALI_LOG_ERROR("Hierarchical/Theta batch evaluation received %zu subproblem log-likelihood values, expected %zu.\n", subBatchLogLikelihood.size(), batchSize);
+
+  const auto batchHierarchicalCorrection = calculateHierarchicalCorrectionBatch(batchParameters);
+  std::vector<double> batchLogLikelihood(batchSize, -Inf);
+  for (size_t i = 0; i < batchSize; ++i)
+  {
+    if (isfinite(batchLogPriors[i]) == false || isfinite(subBatchLogLikelihood[i]) == false) continue;
+    batchLogLikelihood[i] = subBatchLogLikelihood[i] + batchHierarchicalCorrection[i];
+  }
+
+  sample["Batch logLikelihood"] = batchLogLikelihood;
 }
 
 void Theta::setConfiguration(knlohmann::json& js) 
