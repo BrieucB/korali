@@ -41,6 +41,14 @@ class Reference : public Bayesian
   double compute_normalized_sse(std::vector<double> f, std::vector<double> g, std::vector<double> y);
 
   /**
+   * @brief Evaluates the Normal log-likelihood for the given reference evaluations and standard deviations.
+   * @param refEvals Reference evaluations for a single sample
+   * @param stdDevs Pointwise standard deviations for a single sample
+   * @return The Normal log-likelihood value
+   */
+  double loglikelihoodNormalValue(const std::vector<double> &refEvals, std::vector<double> stdDevs);
+
+  /**
    * @brief An implementation of the normal likelihood y~N(f,g), where f ang g are provided by the user.
    * @param sample A Korali Sample
    */
@@ -142,6 +150,10 @@ class Reference : public Bayesian
   */
    std::uint64_t _computationalModel;
   /**
+  * @brief Enables the optional batch-evaluation path for problems that also provide a batch computational model.
+  */
+   int _useBatchEvaluation;
+  /**
   * @brief Reference data required to calculate likelihood. Model evaluations are compared against these data.
   */
    std::vector<double> _referenceData;
@@ -149,6 +161,10 @@ class Reference : public Bayesian
   * @brief Specifies the likelihood model to approximate the reference data to.
   */
    std::string _likelihoodModel;
+  /**
+  * @brief [Internal Use] Stores the optional computational model used for batched likelihood evaluation.
+  */
+   std::uint64_t _batchComputationalModel;
   
  
   /**
@@ -174,6 +190,8 @@ class Reference : public Bayesian
 
   void initialize() override;
   void evaluateLoglikelihood(korali::Sample &sample) override;
+  void evaluateBatch(korali::Sample &sample) override;
+  bool supportsEvaluateBatch() const override;
   void evaluateLoglikelihoodGradient(korali::Sample &sample) override;
   void evaluateLogLikelihoodHessian(korali::Sample &sample) override;
   void evaluateFisherInformation(korali::Sample &sample) override;

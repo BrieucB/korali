@@ -26,6 +26,13 @@ void Reference::initialize()
 
   if (_referenceData.size() == 0) KORALI_LOG_ERROR("Bayesian (%s) problems require defining reference data.\n", _likelihoodModel.c_str());
   if (_k->_variables.size() < 1) KORALI_LOG_ERROR("Bayesian (%s) inference problems require at least one variable.\n", _likelihoodModel.c_str());
+  if (_useBatchEvaluation != 0)
+  {
+    if (_batchComputationalModel == _computationalModel)
+      KORALI_LOG_ERROR("Batch evaluation is enabled, but 'Batch Computational Model' was not provided or matches 'Computational Model'.\n");
+    if (_likelihoodModel != "Normal")
+      KORALI_LOG_ERROR("Batch evaluation currently supports only the 'Normal' likelihood model (requested '%s').\n", _likelihoodModel.c_str());
+  }
 }
 
 void Reference::evaluateLoglikelihood(Sample &sample)
@@ -49,6 +56,11 @@ void Reference::evaluateLoglikelihood(Sample &sample)
     KORALI_LOG_ERROR("Bayesian problem (%s) not recognized.\n", _likelihoodModel.c_str());
 }
 
+bool Reference::supportsEvaluateBatch() const
+{
+  return _useBatchEvaluation != 0 && _batchComputationalModel != _computationalModel;
+}
+
 double Reference::compute_normalized_sse(std::vector<double> f, std::vector<double> g, std::vector<double> y)
 {
   double sse = 0.;
@@ -60,17 +72,14 @@ double Reference::compute_normalized_sse(std::vector<double> f, std::vector<doub
   return sse;
 }
 
-void Reference::loglikelihoodNormal(Sample &sample)
+double Reference::loglikelihoodNormalValue(const std::vector<double> &refEvals, std::vector<double> stdDevs)
 {
   size_t Nd = _referenceData.size();
-  auto refEvals = KORALI_GET(std::vector<double>, sample, "Reference Evaluations");
-  auto stdDevs = KORALI_GET(std::vector<double>, sample, "Standard Deviation");
 
   if (stdDevs.size() != Nd) KORALI_LOG_ERROR("This Bayesian (%s) problem requires a %lu-sized Standard Deviation array. Provided: %lu.\n", _likelihoodModel.c_str(), Nd, stdDevs.size());
   if (refEvals.size() != Nd) KORALI_LOG_ERROR("This Bayesian (%s) problem requires a %lu-sized Reference Evaluations array. Provided: %lu.\n", _likelihoodModel.c_str(), Nd, refEvals.size());
 
-  double sse = -Inf;
-  sse = compute_normalized_sse(refEvals, stdDevs, _referenceData);
+  double sse = compute_normalized_sse(refEvals, stdDevs, _referenceData);
 
   double loglike = 0.;
   for (size_t i = 0; i < stdDevs.size(); i++)
@@ -81,7 +90,63 @@ void Reference::loglikelihoodNormal(Sample &sample)
   }
 
   loglike -= 0.5 * (Nd * _log2pi + sse);
-  sample["logLikelihood"] = loglike;
+  return loglike;
+}
+
+void Reference::loglikelihoodNormal(Sample &sample)
+{
+  auto refEvals = KORALI_GET(std::vector<double>, sample, "Reference Evaluations");
+  auto stdDevs = KORALI_GET(std::vector<double>, sample, "Standard Deviation");
+  sample["logLikelihood"] = loglikelihoodNormalValue(refEvals, stdDevs);
+}
+
+void Reference::evaluateBatch(Sample &sample)
+{
+  if (_useBatchEvaluation == 0) KORALI_LOG_ERROR("Batch evaluation requested, but 'Use Batch Evaluation' is disabled.\n");
+  if (_likelihoodModel != "Normal")
+    KORALI_LOG_ERROR("Batch evaluation currently supports only the 'Normal' likelihood model (requested '%s').\n", _likelihoodModel.c_str());
+
+  const auto batchParameters = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Parameters");
+  const size_t batchSize = batchParameters.size();
+  std::vector<double> batchLogPriors(batchSize, -Inf);
+
+  for (size_t i = 0; i < batchSize; ++i)
+  {
+    if (batchParameters[i].size() != _k->_variables.size())
+      KORALI_LOG_ERROR("Batch sample %zu provides %zu parameters, but the problem expects %zu.\n", i, batchParameters[i].size(), _k->_variables.size());
+
+    double logPrior = 0.0;
+    for (size_t j = 0; j < batchParameters[i].size(); ++j)
+      logPrior += _k->_distributions[_k->_variables[j]->_distributionIndex]->getLogDensity(batchParameters[i][j]);
+
+    batchLogPriors[i] = logPrior;
+  }
+  sample["Batch logPrior"] = batchLogPriors;
+
+  if (batchSize == 0)
+  {
+    sample["Batch logLikelihood"] = std::vector<double>();
+    return;
+  }
+
+  sample.run(_batchComputationalModel);
+
+  const auto batchReferenceEvals = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Reference Evaluations");
+  const auto batchStdDevs = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Standard Deviation");
+
+  if (batchReferenceEvals.size() != batchSize)
+    KORALI_LOG_ERROR("Batch evaluation returned %zu reference-evaluation rows, expected %zu.\n", batchReferenceEvals.size(), batchSize);
+  if (batchStdDevs.size() != batchSize)
+    KORALI_LOG_ERROR("Batch evaluation returned %zu standard-deviation rows, expected %zu.\n", batchStdDevs.size(), batchSize);
+
+  std::vector<double> batchLogLikelihood(batchSize, -Inf);
+  for (size_t i = 0; i < batchSize; ++i)
+  {
+    if (isfinite(batchLogPriors[i]) == false) continue;
+    batchLogLikelihood[i] = loglikelihoodNormalValue(batchReferenceEvals[i], batchStdDevs[i]);
+  }
+
+  sample["Batch logLikelihood"] = batchLogLikelihood;
 }
 
 void Reference::loglikelihoodPositiveNormal(Sample &sample)
@@ -631,6 +696,14 @@ void Reference::setConfiguration(knlohmann::json& js)
 {
  if (isDefined(js, "Results"))  eraseValue(js, "Results");
 
+ if (isDefined(js, "Batch Computational Model"))
+ {
+ try { _batchComputationalModel = js["Batch Computational Model"].get<std::uint64_t>();
+} catch (const std::exception& e)
+ { KORALI_LOG_ERROR(" + Object: [ reference ] \n + Key:    ['Batch Computational Model']\n%s", e.what()); } 
+   eraseValue(js, "Batch Computational Model");
+ }
+
  if (isDefined(js, "Computational Model"))
  {
  try { _computationalModel = js["Computational Model"].get<std::uint64_t>();
@@ -639,6 +712,15 @@ void Reference::setConfiguration(knlohmann::json& js)
    eraseValue(js, "Computational Model");
  }
   else   KORALI_LOG_ERROR(" + No value provided for mandatory setting: ['Computational Model'] required by reference.\n"); 
+
+ if (isDefined(js, "Use Batch Evaluation"))
+ {
+ try { _useBatchEvaluation = js["Use Batch Evaluation"].get<int>();
+} catch (const std::exception& e)
+ { KORALI_LOG_ERROR(" + Object: [ reference ] \n + Key:    ['Use Batch Evaluation']\n%s", e.what()); } 
+   eraseValue(js, "Use Batch Evaluation");
+ }
+  else   KORALI_LOG_ERROR(" + No value provided for mandatory setting: ['Use Batch Evaluation'] required by reference.\n"); 
 
  if (isDefined(js, "Reference Data"))
  {
@@ -680,14 +762,19 @@ void Reference::getConfiguration(knlohmann::json& js)
 
  js["Type"] = _type;
    js["Computational Model"] = _computationalModel;
+   js["Use Batch Evaluation"] = _useBatchEvaluation;
    js["Reference Data"] = _referenceData;
    js["Likelihood Model"] = _likelihoodModel;
+   js["Batch Computational Model"] = _batchComputationalModel;
  Bayesian::getConfiguration(js);
 } 
 
 void Reference::applyModuleDefaults(knlohmann::json& js) 
 {
 
+ std::string defaultString = "{\"Use Batch Evaluation\": false, \"Batch Computational Model\": 0}";
+ knlohmann::json defaultJs = knlohmann::json::parse(defaultString);
+ mergeJson(js, defaultJs); 
  Bayesian::applyModuleDefaults(js);
 } 
 

@@ -1,5 +1,7 @@
 #include "engine.hpp"
 #include "modules/experiment/experiment.hpp"
+#include "modules/problem/bayesian/reference/reference.hpp"
+#include "modules/problem/hierarchical/hierarchical.hpp"
 #include "modules/solver/sampler/TMCMC/TMCMC.hpp"
 #include "sample/sample.hpp"
 #include <chrono>
@@ -115,6 +117,77 @@ void TMCMC::runGeneration()
   if (_k->_currentGeneration == 1) setInitialConfiguration();
 
   prepareGeneration();
+  auto *bayesianProblem = dynamic_cast<korali::problem::Bayesian *>(_k->_problem);
+  auto *hierarchicalProblem = dynamic_cast<korali::problem::Hierarchical *>(_k->_problem);
+  const bool useBatchEvaluation =
+      _version == "TMCMC" &&
+      ((bayesianProblem != NULL && bayesianProblem->supportsEvaluateBatch()) ||
+       (hierarchicalProblem != NULL && hierarchicalProblem->supportsEvaluateBatch()));
+
+  if (useBatchEvaluation)
+  {
+    std::vector<size_t> activeChainIds(_chainCount);
+    std::iota(activeChainIds.begin(), activeChainIds.end(), 0);
+
+    while (activeChainIds.size() > 0)
+    {
+      Sample batchSample;
+      batchSample["Module"] = "Problem";
+      batchSample["Operation"] = "Evaluate Batch";
+      batchSample["Sample Id"] = 0;
+      batchSample["Batch Sample Ids"] = activeChainIds;
+
+      std::vector<std::vector<double>> batchParameters;
+      batchParameters.reserve(activeChainIds.size());
+
+      for (size_t localId = 0; localId < activeChainIds.size(); ++localId)
+      {
+        const size_t chainId = activeChainIds[localId];
+        _currentChainStep[chainId]++;
+        batchParameters.push_back(_chainCandidates[chainId]);
+      }
+
+      batchSample["Batch Parameters"] = batchParameters;
+
+      _modelEvaluationCount += activeChainIds.size();
+      KORALI_START(batchSample);
+      KORALI_WAIT(batchSample);
+
+      const auto batchLogLikelihoods = KORALI_GET(std::vector<double>, batchSample, "Batch logLikelihood");
+      const auto batchLogPriors = KORALI_GET(std::vector<double>, batchSample, "Batch logPrior");
+
+      if (batchLogLikelihoods.size() != activeChainIds.size())
+        KORALI_LOG_ERROR("Batched evaluation returned %zu log-likelihood values, expected %zu.\n", batchLogLikelihoods.size(), activeChainIds.size());
+      if (batchLogPriors.size() != activeChainIds.size())
+        KORALI_LOG_ERROR("Batched evaluation returned %zu log-prior values, expected %zu.\n", batchLogPriors.size(), activeChainIds.size());
+
+      std::vector<size_t> nextActiveChainIds;
+      nextActiveChainIds.reserve(activeChainIds.size());
+
+      for (size_t localId = 0; localId < activeChainIds.size(); ++localId)
+      {
+        const size_t chainId = activeChainIds[localId];
+        _chainCandidatesLogLikelihoods[chainId] = batchLogLikelihoods[localId];
+        _chainCandidatesLogPriors[chainId] = batchLogPriors[localId];
+
+        if (isfinite(_chainCandidatesLogPriors[chainId])) _numFinitePriorEvaluations++;
+        if (isfinite(_chainCandidatesLogLikelihoods[chainId])) _numFiniteLikelihoodEvaluations++;
+
+        processCandidate(chainId);
+
+        if (_currentChainStep[chainId] == _chainLengths[chainId] + _currentBurnIn)
+          _finishedChainsCount++;
+        else
+          nextActiveChainIds.push_back(chainId);
+      }
+
+      activeChainIds.swap(nextActiveChainIds);
+    }
+
+    processGeneration();
+    return;
+  }
+
   std::vector<Sample> samples(_chainCount);
 
   while (_finishedChainsCount < _chainCount)
