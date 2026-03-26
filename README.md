@@ -152,24 +152,28 @@ meson install -C build
 
 ### 7. Set KORALI_PYTHONPATH
 
-You have two equivalent options:
+You have two options:
 
-**Option A — use the source tree directly (recommended, always current):**
+**Option A — use the installed site-packages (recommended, required for `libkorali`):**
+
+```bash
+export KORALI_PYTHONPATH=$(find "$KORALI_PREFIX" -type d -path '*/site-packages' | head -1)
+# On o369: /temp/brieuc/Programs/korali/.local/lib/python3.8/site-packages
+```
+
+This is what the local workflow scripts default to. The compiled `libkorali.so`
+extension lives here — without it `import korali` will raise `ModuleNotFoundError`.
+
+**Option B — use the source tree (Python-only changes, no rebuild needed):**
 
 ```bash
 export KORALI_PYTHONPATH=/path/to/workspace/UQ_DPD/korali/python
 ```
 
-This is what the local workflow scripts default to. Any `git pull` on the `korali`
-repo is reflected immediately without a rebuild.
-
-**Option B — use the installed site-packages:**
-
-```bash
-export KORALI_PYTHONPATH=$(find "$KORALI_PREFIX" -type d -path '*/site-packages' | head -1)
-```
-
-Use Option B if you want to be sure you are running the compiled (installed) version.
+⚠ **This only works if `libkorali.so` is present in `korali/python/korali/`.**
+After a fresh clone or a rebuild without install, the `.so` is not there.
+Option B is useful only if you symlink the compiled extension into the source tree,
+or if you have already run `meson install` and want to test Python-layer edits in-place.
 
 ### 8. Verify the installation
 
