@@ -158,7 +158,7 @@ You have two options:
 
 ```bash
 export KORALI_PYTHONPATH=$(find "$KORALI_PREFIX" -type d -path '*/site-packages' | head -1)
-# On o369: /temp/brieuc/Programs/korali/.local/lib/python3.8/site-packages
+# On o369: /net/gauss/home/brieuc/Programs/korali/.local/lib/python3.8/site-packages
 ```
 
 This is what the local workflow scripts default to. The compiled `libkorali.so`
@@ -222,8 +222,8 @@ print(f'rank {MPI.COMM_WORLD.Get_rank()} — korali {korali.__file__}')
 | venv | `/temp/brieuc/workspace/myenv/` |
 | OpenMPI | 4.0.2 (`/usr/bin/mpirun`) |
 | Korali source | `/temp/brieuc/workspace/UQ_DPD/korali` — branch `gpu-batch-eval` |
-| Korali install prefix | `/temp/brieuc/Programs/korali/.local/` |
-| KORALI_PYTHONPATH | `/temp/brieuc/workspace/UQ_DPD/korali/python` |
+| Korali install prefix | `/net/gauss/home/brieuc/Programs/korali/.local/` |
+| KORALI_PYTHONPATH | `/net/gauss/home/brieuc/Programs/korali/.local/lib/python3.8/site-packages` |
 | Build flags | `mpi=true`, `mpi4py=true`, `openmp=false` |
 
 ---
