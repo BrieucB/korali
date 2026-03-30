@@ -64,6 +64,8 @@ korali_deps += [ pybind11_dep ]
 # process optional korali dependencies
 mpi_dep = null_dep
 openmp_dep = null_dep
+cuda_batch_driver_dep = null_dep
+cuda_batch_nvrtc_dep = null_dep
 
 # MPI - Not required because resolution of MPI dependencies can be introduced by the compiler wrapper
 # For example: Cray systems embed MPI dependencies on CC
@@ -89,6 +91,20 @@ if get_option('openmp')
   openmp_dep = dependency('openmp', required: false)
 endif
 korali_deps += [mpi_dep, openmp_dep]
+
+if get_option('native_cuda_batch')
+  cuda_include = '/opt/cuda/include'
+  korali_include += include_directories(cuda_include)
+  assert(cpp.has_header('cuda.h', args: '-I' + cuda_include), 'Could not find cuda.h in ' + cuda_include)
+  assert(cpp.has_header('nvrtc.h', args: '-I' + cuda_include), 'Could not find nvrtc.h in ' + cuda_include)
+  cuda_batch_driver_dep = cpp.find_library('cuda',
+    dirs: ['/usr/lib64', '/usr/lib'],
+    required: true)
+  cuda_batch_nvrtc_dep = cpp.find_library('nvrtc',
+    dirs: ['/opt/cuda/lib64'],
+    required: true)
+endif
+korali_deps += [cuda_batch_driver_dep, cuda_batch_nvrtc_dep]
 
 onednn_dep = null_dep
 if get_option('onednn') or get_option('onednn_path') != ''
@@ -147,10 +163,14 @@ korali_conf.set('_KORALI_USE_ONEDNN', onednn_dep.found(),
 korali_conf.set('_KORALI_USE_CUDNN', cudnn_dep.found(),
   description: 'Use Nvidia CUDNN backend for Deep Neural Networks (requires CUDA)',
 )
+korali_conf.set('_KORALI_USE_CUDA_BATCH', get_option('native_cuda_batch'),
+  description: 'Use the native CUDA batch backend for Hierarchical/Psi',
+)
 summary({
   'MPI': get_option('mpi'),
   'MPI4Py': mpi4py_found,
   'OpenMP': openmp_dep.found(),
+  'NativeCudaBatch': get_option('native_cuda_batch'),
   'oneDNN': onednn_dep.found(),
   'cuDNN': cudnn_dep.found(),
   }, section: 'Dependencies')

@@ -15,6 +15,8 @@
 #include "modules/problem/reinforcementLearning/reinforcementLearning.hpp"
 #include "modules/problem/reinforcementLearning/discrete/discrete.hpp"
 #include "modules/problem/reinforcementLearning/continuous/continuous.hpp"
+#include "modules/distribution/univariate/normal/normal.hpp"
+#include "modules/distribution/univariate/uniform/uniform.hpp"
 #include "sample/sample.hpp"
 
 namespace
@@ -587,7 +589,14 @@ namespace
   // Triggering error on variable with distribution and distributions defined
   pObj->_numberOfSamples = 0;
   pObj->initialize();
-  ASSERT_NO_THROW(pObj->initialize());
+  try
+  {
+    pObj->initialize();
+  }
+  catch (const std::exception &e)
+  {
+    FAIL() << e.what();
+  }
 
   pObj->_numberOfSamples = 10;
   ASSERT_ANY_THROW(pObj->initialize());
@@ -1362,6 +1371,37 @@ namespace
 
   // Testing initialization
   ASSERT_NO_THROW(pObj->initialize());
+  ASSERT_FALSE(pObj->supportsEvaluateBatch());
+
+  std::function<void(korali::Sample&)> batchModelFc = [](Sample& sample)
+  {
+   const auto batchParameters = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Parameters");
+   std::vector<double> batchLogLikelihood(batchParameters.size(), 0.0);
+   for (size_t i = 0; i < batchParameters.size(); ++i)
+     batchLogLikelihood[i] = batchParameters[i][0];
+   sample["Batch logLikelihood"] = batchLogLikelihood;
+  };
+
+  _functionVector.clear();
+  _functionVector.push_back(&batchModelFc);
+  pObj->_useBatchEvaluation = 1;
+  pObj->_batchComputationalModel = 0;
+  pObj->_hasBatchComputationalModel = true;
+  ASSERT_TRUE(pObj->supportsEvaluateBatch());
+
+  Sample batchSample;
+  batchSample["Batch Parameters"] = std::vector<std::vector<double>>({{0.25}, {1.50}});
+  ASSERT_NO_THROW(pObj->evaluateBatch(batchSample));
+  const auto batchLogPrior = KORALI_GET(std::vector<double>, batchSample, "Batch logPrior");
+  const auto batchLogLikelihood = KORALI_GET(std::vector<double>, batchSample, "Batch logLikelihood");
+  ASSERT_EQ(batchLogPrior.size(), 2);
+  ASSERT_EQ(batchLogLikelihood.size(), 2);
+  EXPECT_DOUBLE_EQ(batchLogPrior[0], 0.0);
+  EXPECT_TRUE(std::isinf(batchLogPrior[1]));
+  EXPECT_DOUBLE_EQ(batchLogLikelihood[0], 0.25);
+  EXPECT_TRUE(std::isinf(batchLogLikelihood[1]));
+  pObj->_useBatchEvaluation = 0;
+  pObj->_hasBatchComputationalModel = false;
 
   pObj->_conditionalPriors[0] = "Undefined";
   ASSERT_ANY_THROW(pObj->initialize());
@@ -1450,8 +1490,258 @@ namespace
   problemJs = baseProbJs;
   experimentJs = baseExpJs;
   e["Variables"][0]["Distribution Index"] = 1;
-  ASSERT_NO_THROW(pObj->setConfiguration(problemJs));
+ ASSERT_NO_THROW(pObj->setConfiguration(problemJs));
  }
+
+TEST(Problem, HierarchicalPsiNativeCpuBatch)
+{
+  Experiment e;
+
+  knlohmann::json conditionalNormalJs;
+  conditionalNormalJs["Type"] = "Univariate/Normal";
+  conditionalNormalJs["Mean"] = "mu";
+  conditionalNormalJs["Standard Deviation"] = "sigma";
+  auto conditionalNormal = dynamic_cast<korali::distribution::univariate::Normal *>(korali::Module::getModule(conditionalNormalJs, &e));
+  conditionalNormal->applyVariableDefaults();
+  conditionalNormal->applyModuleDefaults(conditionalNormalJs);
+  conditionalNormal->setConfiguration(conditionalNormalJs);
+  conditionalNormal->_name = "Conditional Theta";
+  e._distributions.push_back(conditionalNormal);
+
+  knlohmann::json conditionalUniformJs;
+  conditionalUniformJs["Type"] = "Univariate/Uniform";
+  conditionalUniformJs["Minimum"] = 0.0;
+  conditionalUniformJs["Maximum"] = 1.0;
+  auto conditionalUniform = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(conditionalUniformJs, &e));
+  conditionalUniform->applyVariableDefaults();
+  conditionalUniform->applyModuleDefaults(conditionalUniformJs);
+  conditionalUniform->setConfiguration(conditionalUniformJs);
+  conditionalUniform->_name = "Conditional Sigma";
+  e._distributions.push_back(conditionalUniform);
+
+  knlohmann::json uniformMuJs;
+  uniformMuJs["Type"] = "Univariate/Uniform";
+  uniformMuJs["Minimum"] = -2.0;
+  uniformMuJs["Maximum"] = 2.0;
+  auto uniformMu = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(uniformMuJs, &e));
+  uniformMu->applyVariableDefaults();
+  uniformMu->applyModuleDefaults(uniformMuJs);
+  uniformMu->setConfiguration(uniformMuJs);
+  uniformMu->_name = "Uniform mu";
+  e._distributions.push_back(uniformMu);
+
+  knlohmann::json uniformSigmaJs;
+  uniformSigmaJs["Type"] = "Univariate/Uniform";
+  uniformSigmaJs["Minimum"] = 0.1;
+  uniformSigmaJs["Maximum"] = 2.0;
+  auto uniformSigma = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(uniformSigmaJs, &e));
+  uniformSigma->applyVariableDefaults();
+  uniformSigma->applyModuleDefaults(uniformSigmaJs);
+  uniformSigma->setConfiguration(uniformSigmaJs);
+  uniformSigma->_name = "Uniform sigma";
+  e._distributions.push_back(uniformSigma);
+
+  Variable muVariable;
+  Variable sigmaVariable;
+  e._variables.push_back(&muVariable);
+  e._variables.push_back(&sigmaVariable);
+  e["Variables"][0]["Name"] = "mu";
+  e["Variables"][0]["Prior Distribution"] = "Uniform mu";
+  e["Variables"][1]["Name"] = "sigma";
+  e["Variables"][1]["Prior Distribution"] = "Uniform sigma";
+  e["Solver"]["Type"] = "Sampler/TMCMC";
+
+  knlohmann::json subExperiment0;
+  subExperiment0["Is Finished"] = true;
+  subExperiment0["Variables"][0]["Name"] = "theta";
+  subExperiment0["Variables"][1]["Name"] = "sigma_obs";
+  subExperiment0["Results"]["Posterior Sample Database"] = std::vector<std::vector<double>>({{0.0, 0.20}, {0.5, 0.40}, {1.0, 0.80}});
+  subExperiment0["Results"]["Posterior Sample LogPrior Database"] = std::vector<double>({0.0, -0.1, -0.2});
+  subExperiment0["Results"]["Posterior Sample LogLikelihood Database"] = std::vector<double>({0.0, 0.0, 0.0});
+
+  knlohmann::json subExperiment1;
+  subExperiment1["Is Finished"] = true;
+  subExperiment1["Variables"][0]["Name"] = "theta";
+  subExperiment1["Variables"][1]["Name"] = "sigma_obs";
+  subExperiment1["Results"]["Posterior Sample Database"] = std::vector<std::vector<double>>({{-0.5, 0.30}, {0.25, 0.50}, {0.75, 0.90}});
+  subExperiment1["Results"]["Posterior Sample LogPrior Database"] = std::vector<double>({-0.3, -0.2, -0.4});
+  subExperiment1["Results"]["Posterior Sample LogLikelihood Database"] = std::vector<double>({0.0, 0.0, 0.0});
+
+  knlohmann::json problemJs;
+  problemJs["Type"] = "Hierarchical/Psi";
+  problemJs["Use Batch Evaluation"] = true;
+  problemJs["Batch Evaluation Backend"] = "NativeCpu";
+  problemJs["Sub Experiments"] = std::vector<knlohmann::json>({subExperiment0, subExperiment1});
+  problemJs["Conditional Priors"] = std::vector<std::string>({"Conditional Theta", "Conditional Sigma"});
+
+  Psi *pObj;
+  ASSERT_NO_THROW(pObj = dynamic_cast<Psi *>(Module::getModule(problemJs, &e)));
+  e._problem = pObj;
+
+  ASSERT_NO_THROW(pObj->applyModuleDefaults(problemJs));
+  ASSERT_NO_THROW(pObj->applyVariableDefaults());
+  ASSERT_NO_THROW(pObj->setConfiguration(problemJs));
+  try
+  {
+    pObj->initialize();
+  }
+  catch (const std::exception &e)
+  {
+    FAIL() << e.what();
+  }
+  ASSERT_TRUE(pObj->supportsEvaluateBatch());
+  ASSERT_EQ(pObj->_batchEvaluationBackend, "NativeCpu");
+
+  Sample scalarSample0;
+  scalarSample0["Parameters"] = std::vector<double>({0.25, 0.5});
+  ASSERT_NO_THROW(pObj->evaluateLogLikelihood(scalarSample0));
+
+  Sample scalarSample1;
+  scalarSample1["Parameters"] = std::vector<double>({0.60, 0.8});
+  ASSERT_NO_THROW(pObj->evaluateLogLikelihood(scalarSample1));
+
+  Sample batchSample;
+  batchSample["Batch Parameters"] = std::vector<std::vector<double>>({{0.25, 0.5}, {0.60, 0.8}, {0.10, 0.05}});
+  ASSERT_NO_THROW(pObj->evaluateBatch(batchSample));
+
+  const auto batchLogPrior = KORALI_GET(std::vector<double>, batchSample, "Batch logPrior");
+  const auto batchLogLikelihood = KORALI_GET(std::vector<double>, batchSample, "Batch logLikelihood");
+
+  ASSERT_EQ(batchLogPrior.size(), 3);
+  ASSERT_EQ(batchLogLikelihood.size(), 3);
+  EXPECT_NEAR(batchLogLikelihood[0], scalarSample0["logLikelihood"].get<double>(), 1e-12);
+  EXPECT_NEAR(batchLogLikelihood[1], scalarSample1["logLikelihood"].get<double>(), 1e-12);
+  EXPECT_TRUE(std::isfinite(batchLogPrior[0]));
+  EXPECT_TRUE(std::isfinite(batchLogPrior[1]));
+  EXPECT_TRUE(std::isinf(batchLogPrior[2]));
+  EXPECT_TRUE(std::isinf(batchLogLikelihood[2]));
+}
+
+#ifdef _KORALI_USE_CUDA_BATCH
+TEST(Problem, HierarchicalPsiNativeCudaBatch)
+{
+  Experiment e;
+
+  knlohmann::json conditionalNormalJs;
+  conditionalNormalJs["Type"] = "Univariate/Normal";
+  conditionalNormalJs["Mean"] = "mu";
+  conditionalNormalJs["Standard Deviation"] = "sigma";
+  auto conditionalNormal = dynamic_cast<korali::distribution::univariate::Normal *>(korali::Module::getModule(conditionalNormalJs, &e));
+  conditionalNormal->applyVariableDefaults();
+  conditionalNormal->applyModuleDefaults(conditionalNormalJs);
+  conditionalNormal->setConfiguration(conditionalNormalJs);
+  conditionalNormal->_name = "Conditional Theta";
+  e._distributions.push_back(conditionalNormal);
+
+  knlohmann::json conditionalUniformJs;
+  conditionalUniformJs["Type"] = "Univariate/Uniform";
+  conditionalUniformJs["Minimum"] = 0.0;
+  conditionalUniformJs["Maximum"] = 1.0;
+  auto conditionalUniform = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(conditionalUniformJs, &e));
+  conditionalUniform->applyVariableDefaults();
+  conditionalUniform->applyModuleDefaults(conditionalUniformJs);
+  conditionalUniform->setConfiguration(conditionalUniformJs);
+  conditionalUniform->_name = "Conditional Sigma";
+  e._distributions.push_back(conditionalUniform);
+
+  knlohmann::json uniformMuJs;
+  uniformMuJs["Type"] = "Univariate/Uniform";
+  uniformMuJs["Minimum"] = -2.0;
+  uniformMuJs["Maximum"] = 2.0;
+  auto uniformMu = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(uniformMuJs, &e));
+  uniformMu->applyVariableDefaults();
+  uniformMu->applyModuleDefaults(uniformMuJs);
+  uniformMu->setConfiguration(uniformMuJs);
+  uniformMu->_name = "Uniform mu";
+  e._distributions.push_back(uniformMu);
+
+  knlohmann::json uniformSigmaJs;
+  uniformSigmaJs["Type"] = "Univariate/Uniform";
+  uniformSigmaJs["Minimum"] = 0.1;
+  uniformSigmaJs["Maximum"] = 2.0;
+  auto uniformSigma = dynamic_cast<korali::distribution::univariate::Uniform *>(korali::Module::getModule(uniformSigmaJs, &e));
+  uniformSigma->applyVariableDefaults();
+  uniformSigma->applyModuleDefaults(uniformSigmaJs);
+  uniformSigma->setConfiguration(uniformSigmaJs);
+  uniformSigma->_name = "Uniform sigma";
+  e._distributions.push_back(uniformSigma);
+
+  Variable muVariable;
+  Variable sigmaVariable;
+  e._variables.push_back(&muVariable);
+  e._variables.push_back(&sigmaVariable);
+  e["Variables"][0]["Name"] = "mu";
+  e["Variables"][0]["Prior Distribution"] = "Uniform mu";
+  e["Variables"][1]["Name"] = "sigma";
+  e["Variables"][1]["Prior Distribution"] = "Uniform sigma";
+  e["Solver"]["Type"] = "Sampler/TMCMC";
+
+  knlohmann::json subExperiment0;
+  subExperiment0["Is Finished"] = true;
+  subExperiment0["Variables"][0]["Name"] = "theta";
+  subExperiment0["Variables"][1]["Name"] = "sigma_obs";
+  subExperiment0["Results"]["Posterior Sample Database"] = std::vector<std::vector<double>>({{0.0, 0.20}, {0.5, 0.40}, {1.0, 0.80}});
+  subExperiment0["Results"]["Posterior Sample LogPrior Database"] = std::vector<double>({0.0, -0.1, -0.2});
+  subExperiment0["Results"]["Posterior Sample LogLikelihood Database"] = std::vector<double>({0.0, 0.0, 0.0});
+
+  knlohmann::json subExperiment1;
+  subExperiment1["Is Finished"] = true;
+  subExperiment1["Variables"][0]["Name"] = "theta";
+  subExperiment1["Variables"][1]["Name"] = "sigma_obs";
+  subExperiment1["Results"]["Posterior Sample Database"] = std::vector<std::vector<double>>({{-0.5, 0.30}, {0.25, 0.50}, {0.75, 0.90}});
+  subExperiment1["Results"]["Posterior Sample LogPrior Database"] = std::vector<double>({-0.3, -0.2, -0.4});
+  subExperiment1["Results"]["Posterior Sample LogLikelihood Database"] = std::vector<double>({0.0, 0.0, 0.0});
+
+  knlohmann::json problemJs;
+  problemJs["Type"] = "Hierarchical/Psi";
+  problemJs["Use Batch Evaluation"] = true;
+  problemJs["Batch Evaluation Backend"] = "NativeCuda";
+  problemJs["Sub Experiments"] = std::vector<knlohmann::json>({subExperiment0, subExperiment1});
+  problemJs["Conditional Priors"] = std::vector<std::string>({"Conditional Theta", "Conditional Sigma"});
+
+  Psi *pObj;
+  ASSERT_NO_THROW(pObj = dynamic_cast<Psi *>(Module::getModule(problemJs, &e)));
+  e._problem = pObj;
+
+  ASSERT_NO_THROW(pObj->applyModuleDefaults(problemJs));
+  ASSERT_NO_THROW(pObj->applyVariableDefaults());
+  ASSERT_NO_THROW(pObj->setConfiguration(problemJs));
+  try
+  {
+    pObj->initialize();
+  }
+  catch (const std::exception &e)
+  {
+    FAIL() << e.what();
+  }
+  ASSERT_TRUE(pObj->supportsEvaluateBatch());
+  ASSERT_EQ(pObj->_batchEvaluationBackend, "NativeCuda");
+
+  Sample scalarSample0;
+  scalarSample0["Parameters"] = std::vector<double>({0.25, 0.5});
+  ASSERT_NO_THROW(pObj->evaluateLogLikelihood(scalarSample0));
+
+  Sample scalarSample1;
+  scalarSample1["Parameters"] = std::vector<double>({0.60, 0.8});
+  ASSERT_NO_THROW(pObj->evaluateLogLikelihood(scalarSample1));
+
+  Sample batchSample;
+  batchSample["Batch Parameters"] = std::vector<std::vector<double>>({{0.25, 0.5}, {0.60, 0.8}, {0.10, 0.05}});
+  ASSERT_NO_THROW(pObj->evaluateBatch(batchSample));
+
+  const auto batchLogPrior = KORALI_GET(std::vector<double>, batchSample, "Batch logPrior");
+  const auto batchLogLikelihood = KORALI_GET(std::vector<double>, batchSample, "Batch logLikelihood");
+
+  ASSERT_EQ(batchLogPrior.size(), 3);
+  ASSERT_EQ(batchLogLikelihood.size(), 3);
+  EXPECT_NEAR(batchLogLikelihood[0], scalarSample0["logLikelihood"].get<double>(), 1e-9);
+  EXPECT_NEAR(batchLogLikelihood[1], scalarSample1["logLikelihood"].get<double>(), 1e-9);
+  EXPECT_TRUE(std::isfinite(batchLogPrior[0]));
+  EXPECT_TRUE(std::isfinite(batchLogPrior[1]));
+  EXPECT_TRUE(std::isinf(batchLogPrior[2]));
+  EXPECT_TRUE(std::isinf(batchLogLikelihood[2]));
+}
+#endif
 
  TEST(Problem, HierarchicalTheta)
  {

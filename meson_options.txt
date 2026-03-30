@@ -26,6 +26,13 @@ option('openmp',
   yield: true
 )
 
+option('native_cuda_batch',
+  type : 'boolean',
+  value : false,
+  description : 'Native CUDA batch backend support for Hierarchical/Psi',
+  yield: true
+)
+
 option('onednn',
   type : 'boolean',
   value : false,
