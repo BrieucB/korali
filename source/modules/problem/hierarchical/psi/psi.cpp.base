@@ -6,9 +6,14 @@
 #include "sample/sample.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 
 #ifdef _KORALI_USE_CUDA_BATCH
@@ -18,8 +23,101 @@
 
 namespace
 {
+using steadyClock = std::chrono::steady_clock;
+
 constexpr size_t kNativeBatchOmpThreshold = 128;
 constexpr unsigned int kNativeCudaThreadBlockSize = 256;
+
+inline double elapsedSeconds(const steadyClock::time_point &start, const steadyClock::time_point &end)
+{
+  return std::chrono::duration<double>(end - start).count();
+}
+
+inline std::string nativeCudaProfilePath()
+{
+  const char *profilePath = std::getenv("HUQ_PSI_NATIVE_CUDA_PROFILE_JSONL");
+  if (profilePath == nullptr) return "";
+  return profilePath;
+}
+
+inline void appendNativeCudaProfileLine(const std::string &line)
+{
+  const std::string profilePath = nativeCudaProfilePath();
+  if (profilePath.empty()) return;
+
+  static std::mutex profileMutex;
+  std::lock_guard<std::mutex> lock(profileMutex);
+
+  std::ofstream handle(profilePath, std::ios::app);
+  if (handle.good() == false) return;
+  handle << line << '\n';
+}
+
+inline void appendNativeCudaSetupProfileRecord(
+    int deviceId,
+    unsigned int subProblemCount,
+    unsigned int dynamicPriorCount,
+    double contextSeconds,
+    double compileSeconds,
+    double moduleLoadSeconds,
+    double allocSeconds,
+    double h2dSeconds,
+    double totalSeconds)
+{
+  std::ostringstream record;
+  record << std::setprecision(17);
+  record << "{\"kind\":\"native_cuda_setup\""
+         << ",\"device_id\":" << deviceId
+         << ",\"sub_problem_count\":" << subProblemCount
+         << ",\"dynamic_prior_count\":" << dynamicPriorCount
+         << ",\"context_seconds\":" << contextSeconds
+         << ",\"compile_seconds\":" << compileSeconds
+         << ",\"module_load_seconds\":" << moduleLoadSeconds
+         << ",\"alloc_seconds\":" << allocSeconds
+         << ",\"h2d_seconds\":" << h2dSeconds
+         << ",\"total_seconds\":" << totalSeconds
+         << "}";
+  appendNativeCudaProfileLine(record.str());
+}
+
+inline void appendNativeCudaBatchProfileRecord(
+    unsigned int batchSize,
+    unsigned int parameterCount,
+    unsigned int subProblemCount,
+    unsigned int dynamicPriorCount,
+    double logPriorSeconds,
+    double flattenSeconds,
+    double contextSeconds,
+    double allocSeconds,
+    double h2dSeconds,
+    double launchSeconds,
+    double computeSeconds,
+    double d2hSeconds,
+    double freeSeconds,
+    double hostReduceSeconds,
+    double totalSeconds)
+{
+  std::ostringstream record;
+  record << std::setprecision(17);
+  record << "{\"kind\":\"native_cuda_batch\""
+         << ",\"batch_size\":" << batchSize
+         << ",\"parameter_count\":" << parameterCount
+         << ",\"sub_problem_count\":" << subProblemCount
+         << ",\"dynamic_prior_count\":" << dynamicPriorCount
+         << ",\"log_prior_seconds\":" << logPriorSeconds
+         << ",\"flatten_seconds\":" << flattenSeconds
+         << ",\"context_seconds\":" << contextSeconds
+         << ",\"alloc_seconds\":" << allocSeconds
+         << ",\"h2d_seconds\":" << h2dSeconds
+         << ",\"launch_seconds\":" << launchSeconds
+         << ",\"compute_seconds\":" << computeSeconds
+         << ",\"d2h_seconds\":" << d2hSeconds
+         << ",\"free_seconds\":" << freeSeconds
+         << ",\"host_reduce_seconds\":" << hostReduceSeconds
+         << ",\"total_seconds\":" << totalSeconds
+         << "}";
+  appendNativeCudaProfileLine(record.str());
+}
 
 #ifdef _KORALI_USE_CUDA_BATCH
 inline void cudaDriverErrCheck(CUresult status, const char *statement, const char *file, int line)
@@ -423,8 +521,16 @@ void Psi::initializeNativeCudaBatch()
 #ifndef _KORALI_USE_CUDA_BATCH
   KORALI_LOG_ERROR("Hierarchical/Psi native CUDA batch backend requested, but Korali was built without -Dnative_cuda_batch=true.\n");
 #else
+  const auto setupStart = steadyClock::now();
+  double contextSeconds = 0.0;
+  double compileSeconds = 0.0;
+  double moduleLoadSeconds = 0.0;
+  double allocSeconds = 0.0;
+  double h2dSeconds = 0.0;
+
   releaseNativeCudaBatch();
 
+  auto contextStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuInit(0));
 
   int deviceCount = 0;
@@ -434,11 +540,13 @@ void Psi::initializeNativeCudaBatch()
   KORALI_CUDA_DRIVER_CHECK(cuDeviceGet(&_nativeCudaDevice, _nativeCudaDeviceId));
   KORALI_CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRetain(&_nativeCudaContext, _nativeCudaDevice));
   KORALI_CUDA_DRIVER_CHECK(cuCtxSetCurrent(_nativeCudaContext));
+  contextSeconds += elapsedSeconds(contextStart, steadyClock::now());
 
   int major = 0;
   int minor = 0;
   KORALI_CUDA_DRIVER_CHECK(cuDeviceComputeCapability(&major, &minor, _nativeCudaDevice));
 
+  auto compileStart = steadyClock::now();
   nvrtcProgram program;
   KORALI_NVRTC_CHECK(nvrtcCreateProgram(&program, kPsiNativeCudaKernelSource, "psi_native_cuda.cu", 0, nullptr, nullptr));
 
@@ -465,9 +573,12 @@ void Psi::initializeNativeCudaBatch()
   KORALI_NVRTC_CHECK(nvrtcDestroyProgram(&program));
   const std::string kernelName = extractCudaKernelEntryName(ptx);
   if (kernelName.empty()) KORALI_LOG_ERROR("Failed to extract CUDA kernel entry name from generated PTX for native Psi batch backend.\n");
+  compileSeconds += elapsedSeconds(compileStart, steadyClock::now());
 
+  auto moduleLoadStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuModuleLoadData(&_nativeCudaModule, ptx.c_str()));
   KORALI_CUDA_DRIVER_CHECK(cuModuleGetFunction(&_nativeCudaLogLikelihoodKernel, _nativeCudaModule, kernelName.c_str()));
+  moduleLoadSeconds += elapsedSeconds(moduleLoadStart, steadyClock::now());
 
   const size_t dynamicPriorCount = _nativeDynamicConditionalPriorIndexes.size();
 
@@ -513,48 +624,78 @@ void Psi::initializeNativeCudaBatch()
 
     if (dynamicCoordinates.empty() == false)
     {
+      auto allocStart = steadyClock::now();
       KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaSubProblemCoordinates[subProblemId], dynamicCoordinates.size() * sizeof(double)));
+      allocSeconds += elapsedSeconds(allocStart, steadyClock::now());
+
+      auto h2dStart = steadyClock::now();
       KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemCoordinates[subProblemId], dynamicCoordinates.data(), dynamicCoordinates.size() * sizeof(double)));
+      h2dSeconds += elapsedSeconds(h2dStart, steadyClock::now());
       coordinatePointers[subProblemId] = _nativeCudaSubProblemCoordinates[subProblemId];
     }
 
     if (cache._baseLogWeights.empty() == false)
     {
+      auto allocStart = steadyClock::now();
       KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaSubProblemBaseLogWeights[subProblemId], cache._baseLogWeights.size() * sizeof(double)));
+      allocSeconds += elapsedSeconds(allocStart, steadyClock::now());
+
+      auto h2dStart = steadyClock::now();
       KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemBaseLogWeights[subProblemId], cache._baseLogWeights.data(), cache._baseLogWeights.size() * sizeof(double)));
+      h2dSeconds += elapsedSeconds(h2dStart, steadyClock::now());
       baseLogWeightPointers[subProblemId] = _nativeCudaSubProblemBaseLogWeights[subProblemId];
     }
   }
 
   if (coordinatePointers.empty() == false)
   {
+    auto allocStart = steadyClock::now();
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaSubProblemCoordinatesDevice, coordinatePointers.size() * sizeof(CUdeviceptr)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemCoordinatesDevice, coordinatePointers.data(), coordinatePointers.size() * sizeof(CUdeviceptr)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaSubProblemBaseLogWeightsDevice, baseLogWeightPointers.size() * sizeof(CUdeviceptr)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemBaseLogWeightsDevice, baseLogWeightPointers.data(), baseLogWeightPointers.size() * sizeof(CUdeviceptr)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaSubProblemSampleCountsDevice, sampleCounts.size() * sizeof(unsigned int)));
+    allocSeconds += elapsedSeconds(allocStart, steadyClock::now());
+
+    auto h2dStart = steadyClock::now();
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemCoordinatesDevice, coordinatePointers.data(), coordinatePointers.size() * sizeof(CUdeviceptr)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemBaseLogWeightsDevice, baseLogWeightPointers.data(), baseLogWeightPointers.size() * sizeof(CUdeviceptr)));
     KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaSubProblemSampleCountsDevice, sampleCounts.data(), sampleCounts.size() * sizeof(unsigned int)));
+    h2dSeconds += elapsedSeconds(h2dStart, steadyClock::now());
   }
 
   if (dynamicPriorCount > 0)
   {
+    auto allocStart = steadyClock::now();
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaPriorKindsDevice, dynamicPriorCount * sizeof(int)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaPriorKindsDevice, priorKinds.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterAIsVariableDevice, dynamicPriorCount * sizeof(int)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAIsVariableDevice, parameterAIsVariable.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterAPositionDevice, dynamicPriorCount * sizeof(int)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAPositionDevice, parameterAPositions.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterAValueDevice, dynamicPriorCount * sizeof(double)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAValueDevice, parameterAValues.data(), dynamicPriorCount * sizeof(double)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterBIsVariableDevice, dynamicPriorCount * sizeof(int)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterBIsVariableDevice, parameterBIsVariable.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterBPositionDevice, dynamicPriorCount * sizeof(int)));
-    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterBPositionDevice, parameterBPositions.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&_nativeCudaParameterBValueDevice, dynamicPriorCount * sizeof(double)));
+    allocSeconds += elapsedSeconds(allocStart, steadyClock::now());
+
+    auto h2dStart = steadyClock::now();
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaPriorKindsDevice, priorKinds.data(), dynamicPriorCount * sizeof(int)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAIsVariableDevice, parameterAIsVariable.data(), dynamicPriorCount * sizeof(int)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAPositionDevice, parameterAPositions.data(), dynamicPriorCount * sizeof(int)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterAValueDevice, parameterAValues.data(), dynamicPriorCount * sizeof(double)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterBIsVariableDevice, parameterBIsVariable.data(), dynamicPriorCount * sizeof(int)));
+    KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterBPositionDevice, parameterBPositions.data(), dynamicPriorCount * sizeof(int)));
     KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(_nativeCudaParameterBValueDevice, parameterBValues.data(), dynamicPriorCount * sizeof(double)));
+    h2dSeconds += elapsedSeconds(h2dStart, steadyClock::now());
   }
 
   _nativeCudaInitialized = true;
+  appendNativeCudaSetupProfileRecord(
+      _nativeCudaDeviceId,
+      static_cast<unsigned int>(_nativeSubProblemCaches.size()),
+      static_cast<unsigned int>(dynamicPriorCount),
+      contextSeconds,
+      compileSeconds,
+      moduleLoadSeconds,
+      allocSeconds,
+      h2dSeconds,
+      elapsedSeconds(setupStart, steadyClock::now()));
 #endif
 }
 
@@ -828,9 +969,22 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
 #ifndef _KORALI_USE_CUDA_BATCH
   KORALI_LOG_ERROR("Hierarchical/Psi native CUDA batch evaluation requested, but Korali was built without -Dnative_cuda_batch=true.\n");
 #else
+  const auto batchStart = steadyClock::now();
+  double logPriorSeconds = 0.0;
+  double flattenSeconds = 0.0;
+  double contextSeconds = 0.0;
+  double allocSeconds = 0.0;
+  double h2dSeconds = 0.0;
+  double launchSeconds = 0.0;
+  double computeSeconds = 0.0;
+  double d2hSeconds = 0.0;
+  double freeSeconds = 0.0;
+  double hostReduceSeconds = 0.0;
+
   if (_nativeCudaInitialized == false)
     KORALI_LOG_ERROR("Hierarchical/Psi native CUDA batch evaluation requested before the CUDA backend was initialized.\n");
 
+  auto logPriorStart = steadyClock::now();
   const auto batchParameters = KORALI_GET(std::vector<std::vector<double>>, sample, "Batch Parameters");
   const size_t batchSize = batchParameters.size();
   std::vector<double> batchLogPriors(batchSize, -Inf);
@@ -846,6 +1000,7 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
 
     batchLogPriors[i] = logPrior;
   }
+  logPriorSeconds = elapsedSeconds(logPriorStart, steadyClock::now());
 
   sample["Batch logPrior"] = batchLogPriors;
 
@@ -860,18 +1015,27 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
   unsigned int dynamicPriorCount = static_cast<unsigned int>(_nativeDynamicConditionalPriorIndexes.size());
   unsigned int subProblemCount = static_cast<unsigned int>(_nativeSubProblemCaches.size());
 
+  auto flattenStart = steadyClock::now();
   std::vector<double> flattenedBatchParameters(batchSize * parameterCount, 0.0);
   for (size_t batchId = 0; batchId < batchSize; ++batchId)
     std::copy(batchParameters[batchId].begin(), batchParameters[batchId].end(), flattenedBatchParameters.begin() + batchId * parameterCount);
+  flattenSeconds = elapsedSeconds(flattenStart, steadyClock::now());
 
+  auto contextStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuCtxSetCurrent(_nativeCudaContext));
+  contextSeconds = elapsedSeconds(contextStart, steadyClock::now());
 
   CUdeviceptr batchParametersDevice = 0;
   CUdeviceptr subProblemLogLikelihoodDevice = 0;
 
+  auto allocStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&batchParametersDevice, flattenedBatchParameters.size() * sizeof(double)));
-  KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(batchParametersDevice, flattenedBatchParameters.data(), flattenedBatchParameters.size() * sizeof(double)));
   KORALI_CUDA_DRIVER_CHECK(cuMemAlloc(&subProblemLogLikelihoodDevice, static_cast<size_t>(batchSizeInt) * subProblemCount * sizeof(double)));
+  allocSeconds = elapsedSeconds(allocStart, steadyClock::now());
+
+  auto h2dStart = steadyClock::now();
+  KORALI_CUDA_DRIVER_CHECK(cuMemcpyHtoD(batchParametersDevice, flattenedBatchParameters.data(), flattenedBatchParameters.size() * sizeof(double)));
+  h2dSeconds = elapsedSeconds(h2dStart, steadyClock::now());
 
   void *kernelParameters[] = {
       &batchParametersDevice,
@@ -891,6 +1055,7 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
       &subProblemCount,
       &subProblemLogLikelihoodDevice};
 
+  auto launchStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuLaunchKernel(
       _nativeCudaLogLikelihoodKernel,
       batchSizeInt,
@@ -903,14 +1068,23 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
       nullptr,
       kernelParameters,
       nullptr));
+  launchSeconds = elapsedSeconds(launchStart, steadyClock::now());
+
+  auto computeStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuCtxSynchronize());
+  computeSeconds = elapsedSeconds(computeStart, steadyClock::now());
 
   std::vector<double> subProblemLogLikelihoods(static_cast<size_t>(batchSizeInt) * subProblemCount, -Inf);
+  auto d2hStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuMemcpyDtoH(subProblemLogLikelihoods.data(), subProblemLogLikelihoodDevice, subProblemLogLikelihoods.size() * sizeof(double)));
+  d2hSeconds = elapsedSeconds(d2hStart, steadyClock::now());
 
+  auto freeStart = steadyClock::now();
   KORALI_CUDA_DRIVER_CHECK(cuMemFree(batchParametersDevice));
   KORALI_CUDA_DRIVER_CHECK(cuMemFree(subProblemLogLikelihoodDevice));
+  freeSeconds = elapsedSeconds(freeStart, steadyClock::now());
 
+  auto hostReduceStart = steadyClock::now();
   std::vector<double> batchLogLikelihood(batchSize, -Inf);
 
   for (size_t batchId = 0; batchId < batchSize; ++batchId)
@@ -937,8 +1111,25 @@ void Psi::evaluateBatchNativeCuda(Sample &sample)
 
     batchLogLikelihood[batchId] = feasible ? logLikelihood : -Inf;
   }
+  hostReduceSeconds = elapsedSeconds(hostReduceStart, steadyClock::now());
 
   sample["Batch logLikelihood"] = batchLogLikelihood;
+  appendNativeCudaBatchProfileRecord(
+      batchSizeInt,
+      parameterCount,
+      subProblemCount,
+      dynamicPriorCount,
+      logPriorSeconds,
+      flattenSeconds,
+      contextSeconds,
+      allocSeconds,
+      h2dSeconds,
+      launchSeconds,
+      computeSeconds,
+      d2hSeconds,
+      freeSeconds,
+      hostReduceSeconds,
+      elapsedSeconds(batchStart, steadyClock::now()));
 #endif
 }
 
